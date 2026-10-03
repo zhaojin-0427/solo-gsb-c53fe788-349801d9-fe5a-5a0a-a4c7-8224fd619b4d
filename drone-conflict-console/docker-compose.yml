@@ -14,5 +14,26 @@ services:
       timeout: 5s
       retries: 5
 
+  # Optional second process on the SAME database volume, used to verify
+  # database-level revision arbitration across processes:
+  #   docker compose --profile multiproc up
+  # Then web (8000) and web2 (8012) are independent uvicorn processes sharing
+  # /data/console.db.  Not started by the plain `docker compose up` flow.
+  web2:
+    profiles: ["multiproc"]
+    build: .
+    image: drone-conflict-console:latest
+    container_name: drone-conflict-console-2
+    ports:
+      - "8012:8000"
+    volumes:
+      - dcc-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
 volumes:
   dcc-data:

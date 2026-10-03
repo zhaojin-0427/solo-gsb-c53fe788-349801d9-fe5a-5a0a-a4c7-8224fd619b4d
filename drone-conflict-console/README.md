@@ -32,7 +32,9 @@
 - **执行批次与偏差预警**：从已保存的可行方案创建**执行批次**，冻结输入航迹快照、
   安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。各架次以**非负整数秒
   实际起飞偏移 + 修订号**（首版 1、严格递增）上报；同号同值重试幂等，同号异值或
-  旧号返回冲突，并发上报只保留最高修订。给定非负当前秒 `t` 做预警：早于任一已
+  旧号返回冲突，并发上报只保留最高修订。裁决在存储层的单个 SQLite 原子事务
+  （`BEGIN IMMEDIATE`）内完成，**多个 OS 进程共库**（如多个 uvicorn / 容器指向
+  同一数据库文件）时也不会被旧修订回退。给定非负当前秒 `t` 做预警：早于任一已
   上报实际起飞时刻则拒绝；已上报按实际起飞、未上报且计划起飞不早于 `t` 按计划
   起飞、其余标为**逾期**并排除预测（结果标明“预测不完整”）；沿用连续时间冲突
   判定返回 `t` 及之后的冲突区间、首个冲突时刻与已上报架次的偏离计划秒数。
@@ -57,7 +59,7 @@ drone-conflict-console/
 │   ├── solver.py        # OR-Tools CP-SAT 建模、字典序择优、无解核枚举
 │   ├── batch.py         # 批次预警纯逻辑：状态分类 + 连续时间冲突投影
 │   ├── schemas.py       # 导入/求解/上报请求的校验
-│   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报）
+│   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报；数据库级原子裁决）
 │   └── static/          # 原生 JS + Canvas 前端（无构建步骤）
 ├── examples/crossroads.json
 ├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
@@ -90,6 +92,16 @@ docker compose up --build
 ```bash
 docker compose down          # 保留数据
 docker compose down -v       # 同时删除已保存数据
+```
+
+需要复现“多进程共库”时，可额外启动第二个服务进程 `web2`（宿主端口 **8012**，
+与默认 `web` 共享同一个 `dcc-data` 卷，即同一个 SQLite 文件；它不参与普通的
+一键启动，仅用于验证）：
+
+```bash
+docker compose --profile multiproc up --build
+# web:  http://localhost:8000   web2: http://localhost:8012
+docker compose --profile multiproc down        # 停止两个进程
 ```
 
 ---
@@ -305,8 +317,23 @@ curl -i -X PUT http://localhost:8000/api/batches/1/reports \
 ```
 
 约束：`actual_offset`、`revision` 为整数，`actual_offset >= 0`、`revision >= 1`，
-否则 `422`；未知批次/架次返回 `404`。并发对同一架次以不同修订号上报时，存储层
-在同一把锁内做比较并写入，最终**只保留最高修订号**那一条。
+否则 `422`；未知批次/架次返回 `404`。
+
+**并发裁决（含多进程共库）**：并发对同一架次以不同修订号上报时，裁决完全在
+**存储层**内按**数据库级原子事务**（单条 `BEGIN IMMEDIATE` 事务先取 SQLite
+写锁再比较-写入）完成，不依赖进程内锁——因此即使两个**独立 OS 进程**（如两个
+uvicorn 实例 / 容器）指向同一个 SQLite 文件，也不会出现“两边都读到旧修订、
+后写覆盖高修订”的回退：
+
+- 修订 3 先提交：随后的修订 2 返回 `409 stale_revision`，响应
+  `detail.current_revision` 为当前修订 3；
+- 修订 2 先提交：2 正常接受，随后的修订 3 仍可更新；
+- 两种顺序结束后，库中只保留**最高修订 3**，`GET /api/batches/{id}` 批次详情、
+  页面批次视图与 `warning?t=` 预警均使用修订 3 对应的**实际偏移**；
+- 并发**首报**也按同号规则处理：同时首报 `revision=1` 同值为“插入 + 幂等”，
+  同号异值为“插入 + `revision_value_conflict`”，首报非 1 仍为
+  `invalid_first_revision`（若对方先插入则相应得到旧号/无效首报之一，但始终
+  只有一行胜出）。
 
 ### 3) 评估预警（含拒绝、逾期、不完整标记）
 
@@ -394,6 +421,62 @@ curl -s "http://localhost:8000/api/batches/2/warning?t=4"
 
 ---
 
+## 双进程共库：修订回退的并发裁决验证
+
+背景：两个**独立进程**共用同一个 SQLite 文件时，进程内互斥锁不互斥。若两边都
+先读到“修订 1”，再无条件写回，则修订 2 会覆盖已提交的修订 3（修订回退）。
+本服务的 `PUT /api/batches/{id}/reports` 经存储层在**单个数据库级原子事务**
+（`BEGIN IMMEDIATE`，取锁在比较之前）内裁决，跨进程同样成立。
+
+仓库内置一键验证脚本（只需 `bash`、`curl`、`python3`）：
+
+```bash
+# 方式 A：本地虚拟环境已就绪时，脚本自行拉起两个 uvicorn 共库（端口 8011/8012）
+scripts/verify_concurrent_reports.sh
+
+# 方式 B：用 Docker Compose 起两个共享 dcc-data 卷的进程（8000 与 8012）
+scripts/verify_concurrent_reports.sh --docker
+```
+
+脚本会：导入示例 → 求解 → 建批次；经**进程 1** 首报修订 1；然后让两个进程在
+同一瞬间分别提交修订 3（偏移 30）与修订 2（偏移 20）；最后断言：
+
+- 修订 3 必然被接受；
+- 若 3 先提交，修订 2 收到 `HTTP 409` 且 `detail.current_revision == 3`；
+  若 2 先提交，2 正常接受、3 随后更新；
+- 两次请求结束后 `GET /api/batches/{id}` 与 `GET /api/batches/{id}/warning?t=30`
+  中 UAV-A 恒为 **修订 3 / 实际偏移 30**（计划 4，偏离 +26s）——即批次详情、
+  页面（打开 <http://localhost:8000/> 的批次卡片）与预警都以最高修订为准；
+- 同号同值重试仍幂等、同号异值仍为 `409 revision_value_conflict`。
+
+也可以完全手动复现（本地两个 uvicorn，分别用不同端口、同一 `DCC_DB_PATH`；
+或用上面的 `--profile multiproc`）：
+
+```bash
+# 终端 A / B：两个进程，同一个数据库文件
+DCC_DB_PATH=./data/shared.db uvicorn app.main:app --port 8011
+DCC_DB_PATH=./data/shared.db uvicorn app.main:app --port 8012
+
+# 建批次后首报修订 1（对 8011）
+curl -s -X PUT http://127.0.0.1:8011/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":7,"revision":1}'
+
+# 两个进程并发提交修订 3 与修订 2
+curl -s -X PUT http://127.0.0.1:8011/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":30,"revision":3}' &
+curl -s -i -X PUT http://127.0.0.1:8012/api/batches/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-A","actual_offset":20,"revision":2}' &
+wait
+
+# 最终详情恒为最高修订 3 / 偏移 30，无论两个请求谁先落盘
+curl -s http://127.0.0.1:8011/api/batches/1 | python3 -m json.tool
+```
+
+---
+
 ## 测试
 
 测试不依赖容器，在本地虚拟环境中运行：
@@ -410,7 +493,8 @@ python tests/test_batches_warning.py       # 批次：修订协议/并发最高�
 - `test_solver_bruteforce.py` 在小窗口下穷举所有起飞组合，验证最优目标、
   字典序择优、锁定约束以及无解核的可行性与包含极小性；
 - `test_batches_warning.py` 验证批次冻结、首版为 1/严格递增/幂等/冲突/并发只留
-  最高修订号，以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间冲突
+  最高修订号（含**跨 OS 进程共用一个 SQLite 文件**的多进程裁决与并发首报），
+  以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间冲突
   区间向 `t` 投影与“重载结果一致”。
 
 ---

@@ -15,6 +15,15 @@ from pathlib import Path
 
 _LOCK = threading.Lock()
 
+# When several OS processes (e.g. two uvicorn workers, or two containers on a
+# shared volume) point at the same database file, the threading lock above only
+# serializes threads inside one process.  SQLite file locks are the real
+# cross-process guard: a write transaction started with ``BEGIN IMMEDIATE``
+# takes the reserved lock before any read, so the compare-and-set in
+# :meth:`Store.submit_report` is atomic at database level.  Other processes
+# wait this long for the lock instead of failing with ``database is locked``.
+_BUSY_TIMEOUT_SECONDS = 10.0
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,10 +65,21 @@ class Store:
         with self._conn() as c:
             c.executescript(_SCHEMA)
 
-    def _conn(self):
-        conn = sqlite3.connect(self.path)
+    def _conn(self, autocommit: bool = False):
+        # isolation_level="" keeps sqlite3's default deferred-transaction mode,
+        # where the module starts a transaction right before a DML statement
+        # and the connection's context manager commits it on success.  With
+        # autocommit=True the module never opens a transaction, so callers can
+        # issue an explicit ``BEGIN IMMEDIATE`` (required for a compare-and-set
+        # that must acquire the cross-process write lock before reading).
+        conn = sqlite3.connect(
+            self.path,
+            timeout=_BUSY_TIMEOUT_SECONDS,
+            isolation_level=None if autocommit else "",
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_SECONDS * 1000)}")
         return conn
 
     def create_scenario(self, input_payload: dict, safety_radius: float,
@@ -168,50 +188,76 @@ class Store:
             return cur.rowcount > 0
 
     def submit_report(self, batch_id: int, sortie_id: str,
-                      actual_offset: int, revision: int) -> dict:
+                      actual_offset: int, revision: int) -> tuple[str, dict | None]:
         """Atomically apply a revision-controlled report.
 
-        The whole compare-and-set runs under the global store lock, so
-        concurrent reports for one sortie resolve deterministically: the
-        single stored row is the highest revision ever accepted.
+        The compare-and-set runs inside one ``BEGIN IMMEDIATE`` transaction:
+        SQLite grants the reserved (write) lock before the row is read, so any
+        other process sharing this database file blocks on the lock instead of
+        reading the same old revision and overwriting it.  Concurrent reports
+        for one sortie therefore resolve deterministically even across OS
+        processes: the single stored row is always the highest revision ever
+        accepted.  The in-process lock just skips lock-waiting between threads
+        of the same process.
 
-        Returns ``(outcome, report)`` with outcome one of
+        Returns ``(outcome, info)`` with outcome one of
         ``inserted`` / ``idempotent`` / ``invalid_first_revision`` /
         ``revision_value_conflict`` / ``stale_revision``.
         """
-        with _LOCK, self._conn() as c:
-            row = c.execute(
-                "SELECT actual_offset,revision FROM batch_reports "
-                "WHERE batch_id=? AND sortie_id=?",
-                (batch_id, sortie_id),
-            ).fetchone()
-            now = time.time()
-            if row is None:
-                if revision != 1:
-                    return "invalid_first_revision", None
-                c.execute(
-                    "INSERT INTO batch_reports(batch_id,sortie_id,actual_offset,"
-                    "revision,reported_at) VALUES (?,?,?,?,?)",
-                    (batch_id, sortie_id, int(actual_offset), int(revision), now),
+        with _LOCK:
+            conn = self._conn(autocommit=True)
+            tx_open = False
+            try:
+                # Acquire the database-level write lock up front; every other
+                # writer (thread or process) waits here until we commit.
+                conn.execute("BEGIN IMMEDIATE")
+                tx_open = True
+                row = conn.execute(
+                    "SELECT actual_offset,revision FROM batch_reports "
+                    "WHERE batch_id=? AND sortie_id=?",
+                    (batch_id, sortie_id),
+                ).fetchone()
+                now = time.time()
+                if row is None:
+                    if revision != 1:
+                        conn.execute("ROLLBACK")
+                        tx_open = False
+                        return "invalid_first_revision", None
+                    conn.execute(
+                        "INSERT INTO batch_reports(batch_id,sortie_id,actual_offset,"
+                        "revision,reported_at) VALUES (?,?,?,?,?)",
+                        (batch_id, sortie_id, int(actual_offset), int(revision), now),
+                    )
+                    conn.execute("COMMIT")
+                    tx_open = False
+                    return "inserted", {"sortie_id": sortie_id,
+                                        "actual_offset": int(actual_offset),
+                                        "revision": int(revision)}
+                cur_off, cur_rev = row["actual_offset"], row["revision"]
+                if revision == cur_rev:
+                    conn.execute("ROLLBACK")
+                    tx_open = False
+                    if actual_offset != cur_off:
+                        return "revision_value_conflict", {
+                            "stored_actual_offset": cur_off}
+                    return "idempotent", {"sortie_id": sortie_id,
+                                          "actual_offset": cur_off,
+                                          "revision": cur_rev}
+                if revision < cur_rev:
+                    conn.execute("ROLLBACK")
+                    tx_open = False
+                    return "stale_revision", {"current_revision": cur_rev}
+                conn.execute(
+                    "UPDATE batch_reports SET actual_offset=?,revision=?,reported_at=? "
+                    "WHERE batch_id=? AND sortie_id=?",
+                    (int(actual_offset), int(revision), now, batch_id, sortie_id),
                 )
+                conn.execute("COMMIT")
+                tx_open = False
                 return "inserted", {"sortie_id": sortie_id,
                                     "actual_offset": int(actual_offset),
                                     "revision": int(revision)}
-            cur_off, cur_rev = row["actual_offset"], row["revision"]
-            if revision == cur_rev:
-                if actual_offset != cur_off:
-                    return "revision_value_conflict", {
-                        "stored_actual_offset": cur_off}
-                return "idempotent", {"sortie_id": sortie_id,
-                                      "actual_offset": cur_off,
-                                      "revision": cur_rev}
-            if revision < cur_rev:
-                return "stale_revision", {"current_revision": cur_rev}
-            c.execute(
-                "UPDATE batch_reports SET actual_offset=?,revision=?,reported_at=? "
-                "WHERE batch_id=? AND sortie_id=?",
-                (int(actual_offset), int(revision), now, batch_id, sortie_id),
-            )
-            return "inserted", {"sortie_id": sortie_id,
-                                "actual_offset": int(actual_offset),
-                                "revision": int(revision)}
+            finally:
+                if tx_open:
+                    conn.execute("ROLLBACK")
+                conn.close()

@@ -270,9 +270,11 @@ def put_report(bid: int, req: ReportRequest):
     known = {s["id"] for s in row["input"]["sorties"]}
     if req.sortie_id not in known:
         raise HTTPException(404, f"sortie not found in batch: {req.sortie_id}")
-    # Atomic compare-and-set: identical retries are idempotent, same revision
-    # with a different value or an older revision conflicts, and concurrent
-    # reports leave only the highest revision stored.
+    # Database-level atomic compare-and-set (a single BEGIN IMMEDIATE
+    # transaction in the store, so it also holds across OS processes sharing
+    # the SQLite file): identical retries are idempotent, same revision with a
+    # different value or an older revision conflicts, and concurrent reports
+    # leave only the highest revision stored.
     outcome, info = store.submit_report(
         bid, req.sortie_id, req.actual_offset, req.revision)
     if outcome in ("idempotent", "inserted"):

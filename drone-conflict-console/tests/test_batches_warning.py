@@ -6,6 +6,11 @@ Covers (without any HTTP layer):
 * report revision protocol: first revision 1, strictly increasing,
   same-revision-same-value idempotence, same-revision-different-value and
   stale revision conflicts, concurrent submissions keep the highest revision;
+* the same arbitration across OS *processes* sharing one SQLite file: the
+  compare-and-set is one database-level atomic transaction
+  (``BEGIN IMMEDIATE``), so a revision-2 report committed while revision 3 is
+  in flight can never overwrite revision 3, and concurrent first reports
+  follow the same-number idempotent / conflict rules;
 * warning classification (reported / planned / overdue), the early-time
   rejection, incomplete flag, continuous-time conflict intervals projected
   onto ``t`` and first-conflict time;
@@ -16,6 +21,7 @@ Run:  python tests/test_batches_warning.py
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import sys
 import tempfile
@@ -156,6 +162,131 @@ def test_concurrent_keeps_highest():
                   f"trial {trial}: highest revision must win, got {outcomes}")
 
 
+def _mp_report_worker(db_path, barrier, index, batch_id, sortie_id,
+                      offset, revision, queue):
+    """Top-level worker so it is picklable for 'spawn' start methods."""
+    store = Store(db_path)
+    barrier.wait()
+    queue.put((index, store.submit_report(batch_id, sortie_id, offset, revision)))
+
+
+def _multiprocess_race(db_path, batch_id, submissions):
+    """Release every (offset, revision) submission from its own OS process."""
+    queue = mp.Queue()
+    barrier = mp.Barrier(len(submissions))
+    procs = [
+        mp.Process(target=_mp_report_worker,
+                   args=(db_path, barrier, i, batch_id, "A", off, rev, queue))
+        for i, (off, rev) in enumerate(submissions)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    for p in procs:
+        check(p.exitcode == 0, f"worker process exited with {p.exitcode}")
+    outcomes = [o for _, o in sorted(queue.get() for _ in procs)]
+    return outcomes
+
+
+def test_multiprocess_revision_arbitration():
+    # Two OS processes sharing one SQLite file must be arbitrated by the
+    # database itself: a threading lock cannot protect them.  After revision 1
+    # is stored, revisions 3 and 2 race.  If 3 commits first, 2 must be rejected
+    # as stale and cite current revision 3; if 2 commits first, 3 still updates.
+    # Either order ends with revision 3 (the highest) as the stored row.
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "t.db")
+        store = Store(db_path)
+        sid = store.create_scenario({"sorties": []}, 30, 10)
+        for trial in range(15):
+            bid = store.create_batch(
+                sid, f"b{trial}", {"sorties": [{"id": "A"}]},
+                30, 10, {"offsets": {"A": 0}})
+            outcome, _ = store.submit_report(bid, "A", 5, 1)
+            check(outcome == "inserted", "seed revision 1")
+            outcomes = _multiprocess_race(db_path, bid, [(30, 3), (20, 2)])
+            o_high, o_low = outcomes  # index order matches submission order
+            check(o_high[0] == "inserted",
+                  f"trial {trial}: revision 3 must always be accepted, got {outcomes}")
+            if o_low[0] == "stale_revision":
+                check(o_low[1]["current_revision"] == 3,
+                      f"trial {trial}: stale conflict must cite current revision 3")
+            else:
+                check(o_low[0] == "inserted",
+                      f"trial {trial}: revision 2 may only win when it commits "
+                      f"before 3, got {outcomes}")
+            row = store.get_batch(bid)["reports"][0]
+            check(row["revision"] == 3 and row["actual_offset"] == 30,
+                  f"trial {trial}: highest revision must survive across "
+                  f"processes, got {dict(row)}")
+
+
+def test_multiprocess_concurrent_first_reports():
+    # Concurrent first reports (no row yet) follow exactly the same-number
+    # rules for revision 1: same value is inserted + idempotent, different
+    # values is inserted + revision_value_conflict.  For a racing non-1
+    # revision, see the dedicated case below.
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "t.db")
+        store = Store(db_path)
+        sid = store.create_scenario({"sorties": []}, 30, 10)
+
+        for trial in range(10):
+            bid = store.create_batch(
+                sid, f"same{trial}", {"sorties": [{"id": "A"}]},
+                30, 10, {"offsets": {"A": 0}})
+            outcomes = _multiprocess_race(db_path, bid, [(7, 1), (7, 1)])
+            names = sorted(o[0] for o in outcomes)
+            check(names == ["idempotent", "inserted"],
+                  f"same-value race must be idempotent, got {outcomes}")
+            row = store.get_batch(bid)["reports"][0]
+            check((row["revision"], row["actual_offset"]) == (1, 7),
+                  "single rev-1 row with the shared value after same-value race")
+
+        for trial in range(10):
+            bid = store.create_batch(
+                sid, f"diff{trial}", {"sorties": [{"id": "A"}]},
+                30, 10, {"offsets": {"A": 0}})
+            outcomes = _multiprocess_race(db_path, bid, [(11, 1), (22, 1)])
+            names = sorted(o[0] for o in outcomes)
+            check(names == ["inserted", "revision_value_conflict"],
+                  f"different-value first reports must conflict, got {outcomes}")
+            conflict = next(o for o in outcomes if o[0] == "revision_value_conflict")
+            check(conflict[1]["stored_actual_offset"] in (11, 22),
+                  "conflict names the value actually stored by the winner")
+            row = store.get_batch(bid)["reports"][0]
+            check(row["revision"] == 1 and row["actual_offset"] in (11, 22),
+                  "exactly one first report survives the different-value race")
+
+        # A first report at revision != 1 is only invalid while no row exists.
+        # Racing first writers (rev 1 vs rev 3) are serialized by the database:
+        # exactly one insert wins.  If rev 3 commits first it is the legitimate
+        # first report (revisions are client-chosen and "first must be 1" is
+        # evaluated against stored state, not wall-clock order); rev 1 is then
+        # stale.  If rev 1 commits first, rev 3 is invalid_first_revision.
+        bid = store.create_batch(
+            sid, "badfirst", {"sorties": [{"id": "A"}]},
+            30, 10, {"offsets": {"A": 0}})
+        outcomes = _multiprocess_race(db_path, bid, [(7, 1), (9, 3)])
+        names = {o[0] for o in outcomes}
+        check(
+            names == {"inserted", "invalid_first_revision"}
+            or names == {"inserted", "stale_revision"},
+            f"racing first reports must serialize to one insert, got {outcomes}")
+        inserted = next(o for o in outcomes if o[0] == "inserted")
+        if inserted[1]["revision"] == 1:
+            check(any(o[0] == "invalid_first_revision" for o in outcomes),
+                  "rev 3 rejected when rev 1 stores first")
+        else:
+            stale = next(o for o in outcomes if o[0] == "stale_revision")
+            check(stale[1]["current_revision"] == 3,
+                  f"rev 1 must be stale against current revision 3, got {stale}")
+        row = store.get_batch(bid)["reports"][0]
+        check((row["revision"], row["actual_offset"]) in ((1, 7), (3, 9)),
+              "exactly one racing first report survives")
+
+
 def test_reload_consistency():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
@@ -179,6 +310,8 @@ def main():
     test_evaluation()
     test_store_revision_protocol()
     test_concurrent_keeps_highest()
+    test_multiprocess_revision_arbitration()
+    test_multiprocess_concurrent_first_reports()
     test_reload_consistency()
     print("failures:", FAILS)
     return FAILS
