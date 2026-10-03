@@ -11,9 +11,18 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+# Serializes writes inside one process; cross-process arbitration is handled
+# by SQLite itself (WAL + a ``BEGIN IMMEDIATE`` write transaction).
 _LOCK = threading.Lock()
+
+#: How long SQLite waits on another process' write lock before raising
+#: "database is locked"; the submit path additionally retries as a safety net.
+_BUSY_TIMEOUT_MS = 5000
+_BUSY_ATTEMPTS = 60
+_BUSY_WAIT_SECONDS = 0.05
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
@@ -53,18 +62,69 @@ class Store:
     def __init__(self, path: str | Path = "data/console.db"):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._conn() as c:
-            c.executescript(_SCHEMA)
+        self._init_database()
+
+    def _init_database(self):
+        """Enable WAL and create the schema, tolerating a peer that is doing
+        the same initialization concurrently.
+
+        Switching journal mode (and, on a fresh file, creating the tables)
+        needs an exclusive lock, so a second process booting at the same time
+        can briefly hit ``database is locked``; retry until it succeeds or
+        confirms the schema already exists.
+        """
+        for attempt in range(_BUSY_ATTEMPTS):
+            with self._conn() as c:
+                try:
+                    # WAL lets multiple processes read while one writes and
+                    # keeps short write transactions from colliding.
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("PRAGMA synchronous=NORMAL")
+                    c.executescript(_SCHEMA)
+                    return
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) or attempt == _BUSY_ATTEMPTS - 1:
+                        raise
+            time.sleep(_BUSY_WAIT_SECONDS)
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(
+            self.path, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         return conn
+
+    @contextmanager
+    def _write_tx(self):
+        """A single ``BEGIN IMMEDIATE`` write transaction.
+
+        This acquires SQLite's reserved lock up front, blocks on a writer that
+        already holds it via ``busy_timeout``, and groups the conditional
+        write + authoritative re-read in one commit.  It does *not* by itself
+        make a read-then-write sequence safe across processes (WAL snapshots
+        differ), so callers must make each write conditional in SQL.
+        """
+        with _LOCK, self._conn() as c:
+            for attempt in range(_BUSY_ATTEMPTS):
+                try:
+                    c.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) or attempt == _BUSY_ATTEMPTS - 1:
+                        raise
+                    time.sleep(_BUSY_WAIT_SECONDS)
+            try:
+                yield c
+            except Exception:
+                c.rollback()
+                raise
+            else:
+                c.commit()
 
     def create_scenario(self, input_payload: dict, safety_radius: float,
                         safety_height: float, name: str = "") -> int:
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
             cur = c.execute(
                 "INSERT INTO scenarios(name,input_json,safety_radius,safety_height,created_at)"
                 " VALUES (?,?,?,?,?)",
@@ -75,7 +135,7 @@ class Store:
 
     def save_result(self, scenario_id: int, result: dict, safety_radius: float,
                     safety_height: float, name: str | None = None) -> None:
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
             if name is not None:
                 c.execute("UPDATE scenarios SET name=? WHERE id=?", (name, scenario_id))
             c.execute(
@@ -105,7 +165,7 @@ class Store:
         return d
 
     def delete_scenario(self, scenario_id: int) -> bool:
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
             # Remove dependent batches (and their reports) explicitly so the
             # cascade works even on databases created before the FK cascade.
             c.execute("DELETE FROM batch_reports WHERE batch_id IN "
@@ -122,7 +182,7 @@ class Store:
     def create_batch(self, scenario_id: int, name: str, input_payload: dict,
                      safety_radius: float, safety_height: float,
                      plan: dict) -> int:
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
             cur = c.execute(
                 "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
                 "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
@@ -163,40 +223,75 @@ class Store:
         return d
 
     def delete_batch(self, batch_id: int) -> bool:
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
             cur = c.execute("DELETE FROM batches WHERE id=?", (batch_id,))
             return cur.rowcount > 0
 
     def submit_report(self, batch_id: int, sortie_id: str,
-                      actual_offset: int, revision: int) -> dict:
+                      actual_offset: int, revision: int) -> tuple[str, dict | None]:
         """Atomically apply a revision-controlled report.
 
-        The whole compare-and-set runs under the global store lock, so
-        concurrent reports for one sortie resolve deterministically: the
-        single stored row is the highest revision ever accepted.
+        The decision is enforced by the database itself rather than by a
+        read-then-write sequence, so it stays correct when several *processes*
+        share the SQLite file.  Inside one ``BEGIN IMMEDIATE`` transaction two
+        guarded statements are issued:
 
-        Returns ``(outcome, report)`` with outcome one of
-        ``inserted`` / ``idempotent`` / ``invalid_first_revision`` /
-        ``revision_value_conflict`` / ``stale_revision``.
+        1. an ``INSERT ... SELECT ... WHERE NOT EXISTS(...) AND revision = 1``
+           that creates the row only for a first report at revision 1;
+        2. an ``UPDATE ... WHERE incoming_revision > stored_revision`` that
+           replaces the row only for a strictly higher revision.
+
+        Because every write is conditional on the row committed at write
+        time, a lower revision can never overwrite a higher one and a
+        same-revision write can never change an existing value, no matter how
+        overlapping transactions commit.  The row is then re-read inside the
+        same transaction to classify the outcome against the authoritative
+        state (so a loser reports the winner's ``current_revision``):
+
+        * no row + revision 1          -> ``inserted``
+        * no row + revision != 1       -> ``invalid_first_revision``
+        * revision == stored revision  -> same value ``idempotent`` /
+          different value ``revision_value_conflict``
+        * revision  < stored revision  -> ``stale_revision``
+        * revision  > stored revision  -> ``inserted``
+
+        Returns ``(outcome, info)``.
         """
-        with _LOCK, self._conn() as c:
+        with self._write_tx() as c:
+            now = time.time()
+            # 1) First report only: create the row when none exists AND the
+            #    incoming revision is 1.
+            cur = c.execute(
+                "INSERT INTO batch_reports(batch_id,sortie_id,actual_offset,"
+                "revision,reported_at) "
+                "SELECT ?,?,?,?,? WHERE ? = 1 AND NOT EXISTS ("
+                "SELECT 1 FROM batch_reports WHERE batch_id=? AND sortie_id=?)",
+                (batch_id, sortie_id, int(actual_offset), int(revision), now,
+                 int(revision), batch_id, sortie_id),
+            )
+            wrote = cur.rowcount > 0
+            # 2) Higher revision only: replace an existing strictly-lower row.
+            if not wrote:
+                cur = c.execute(
+                    "UPDATE batch_reports SET actual_offset=?,revision=?,"
+                    "reported_at=? WHERE batch_id=? AND sortie_id=? AND revision < ?",
+                    (int(actual_offset), int(revision), now,
+                     batch_id, sortie_id, int(revision)),
+                )
+                wrote = cur.rowcount > 0
+            if wrote:
+                return "inserted", {"sortie_id": sortie_id,
+                                    "actual_offset": int(actual_offset),
+                                    "revision": int(revision)}
             row = c.execute(
                 "SELECT actual_offset,revision FROM batch_reports "
                 "WHERE batch_id=? AND sortie_id=?",
                 (batch_id, sortie_id),
             ).fetchone()
-            now = time.time()
             if row is None:
-                if revision != 1:
-                    return "invalid_first_revision", None
-                c.execute(
-                    "INSERT INTO batch_reports(batch_id,sortie_id,actual_offset,"
-                    "revision,reported_at) VALUES (?,?,?,?,?)",
-                    (batch_id, sortie_id, int(actual_offset), int(revision), now),
-                )
-                return "inserted", {"sortie_id": sortie_id,
-                                    "actual_offset": int(actual_offset),
-                                    "revision": int(revision)}
+                # No row exists, so the only legal write is a first report at
+                # revision 1; anything else is rejected unchanged.
+                return "invalid_first_revision", None
             cur_off, cur_rev = row["actual_offset"], row["revision"]
             if revision == cur_rev:
                 if actual_offset != cur_off:
@@ -205,13 +300,4 @@ class Store:
                 return "idempotent", {"sortie_id": sortie_id,
                                       "actual_offset": cur_off,
                                       "revision": cur_rev}
-            if revision < cur_rev:
-                return "stale_revision", {"current_revision": cur_rev}
-            c.execute(
-                "UPDATE batch_reports SET actual_offset=?,revision=?,reported_at=? "
-                "WHERE batch_id=? AND sortie_id=?",
-                (int(actual_offset), int(revision), now, batch_id, sortie_id),
-            )
-            return "inserted", {"sortie_id": sortie_id,
-                                "actual_offset": int(actual_offset),
-                                "revision": int(revision)}
+            return "stale_revision", {"current_revision": cur_rev}

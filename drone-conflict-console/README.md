@@ -32,7 +32,10 @@
 - **执行批次与偏差预警**：从已保存的可行方案创建**执行批次**，冻结输入航迹快照、
   安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。各架次以**非负整数秒
   实际起飞偏移 + 修订号**（首版 1、严格递增）上报；同号同值重试幂等，同号异值或
-  旧号返回冲突，并发上报只保留最高修订。给定非负当前秒 `t` 做预警：早于任一已
+  旧号返回冲突。上报裁决在存储层用**数据库级条件写入**完成，**多个进程共用同一
+  SQLite 文件并发上报时也不会发生修订回退**：高修订号先提交则低号得到带
+  `current_revision` 的旧号冲突，低号先提交则高号仍可更新，终态恒为最高修订号
+  （并发首报同号也按幂等/冲突处理）。给定非负当前秒 `t` 做预警：早于任一已
   上报实际起飞时刻则拒绝；已上报按实际起飞、未上报且计划起飞不早于 `t` 按计划
   起飞、其余标为**逾期**并排除预测（结果标明“预测不完整”）；沿用连续时间冲突
   判定返回 `t` 及之后的冲突区间、首个冲突时刻与已上报架次的偏离计划秒数。
@@ -60,6 +63,8 @@ drone-conflict-console/
 │   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报）
 │   └── static/          # 原生 JS + Canvas 前端（无构建步骤）
 ├── examples/crossroads.json
+├── scripts/
+│   └── verify_multiprocess.py  # 双进程共库并发上报的 HTTP 级验证脚本
 ├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
 ├── requirements.txt
 ├── Dockerfile
@@ -91,6 +96,33 @@ docker compose up --build
 docker compose down          # 保留数据
 docker compose down -v       # 同时删除已保存数据
 ```
+
+### 双进程共用同一数据库（验证并发上报）
+
+默认 `docker compose up` 只启动一个服务进程。若要验证**两个进程同时读写同一份
+SQLite**（例如多副本部署或多 worker）时的修订裁决，可加 `multiproc` profile
+额外启动第二个进程 `web2`：它挂载同一个 `dcc-data` 卷、使用同一个
+`DCC_DB_PATH=/data/console.db`，对外暴露在 **8001** 端口：
+
+```bash
+docker compose --profile multiproc up --build
+# 进程 1 -> http://localhost:8000   （容器内 /data/console.db）
+# 进程 2 -> http://localhost:8001   （同一个文件）
+```
+
+然后在宿主机（装有 Python 3 即可，仅用标准库）运行验证脚本，它会分别向
+8000 / 8001 两个进程并发提交上报，并交叉核对批次详情与预警：
+
+```bash
+python3 scripts/verify_multiprocess.py
+# 自定义地址： BASE1=http://... BASE2=http://... python3 scripts/verify_multiprocess.py
+```
+
+脚本覆盖：修订 3 先提交时，另一进程提交修订 2 返回 `409 stale_revision` 且
+`current_revision=3`；修订 2 先提交时，修订 3 仍可更新；两个进程**同时**提交
+2 与 3（多轮，含两种提交先后）后，批次详情、页面数据与预警一律使用最高修订 3
+的实际偏移；以及并发首报按同号规则处理（同值一插一幂等）。
+结束后 `docker compose --profile multiproc down` 停止两个进程。
 
 ---
 
@@ -204,7 +236,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `GET` | `/api/batches?scenario_id=` | 批次列表（可按场景过滤） |
 | `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报） |
 | `DELETE` | `/api/batches/{id}` | 删除批次及其上报 |
-| `PUT` | `/api/batches/{id}/reports` | 上报某架次实际起飞偏移与修订号（幂等/冲突） |
+| `PUT` | `/api/batches/{id}/reports` | 上报某架次实际起飞偏移与修订号（幂等/冲突，多进程共库也按数据库级规则裁决） |
 | `GET` | `/api/batches/{id}/warning?t=` | 在非负当前秒 `t` 评估偏差预警 |
 | `GET` | `/api/health` | 健康检查 |
 
@@ -305,8 +337,34 @@ curl -i -X PUT http://localhost:8000/api/batches/1/reports \
 ```
 
 约束：`actual_offset`、`revision` 为整数，`actual_offset >= 0`、`revision >= 1`，
-否则 `422`；未知批次/架次返回 `404`。并发对同一架次以不同修订号上报时，存储层
-在同一把锁内做比较并写入，最终**只保留最高修订号**那一条。
+否则 `422`；未知批次/架次返回 `404`。
+
+#### 并发与多进程共库的修订裁决
+
+裁决由**存储层在数据库内**完成，而不是“先读当前修订号、再无条件写回”，因此在
+**多个进程共享同一个 SQLite 文件**时也正确（进程内的线程锁无法跨进程互斥，
+而且 SQLite 的 WAL 快照会让两个并发事务都读到旧值）。`submit_report` 在单个
+`BEGIN IMMEDIATE` 事务里只执行**带条件的写**：
+
+- 首报：`INSERT ... SELECT ... WHERE revision = 1 AND NOT EXISTS(该架次的行)`，
+  无行且修订号为 1 才插入；
+- 更高修订：`UPDATE ... WHERE 入库修订号 < 本次修订号`，仅当现有修订号**严格
+  更小**才覆盖；同号写入不会改变既有值。
+
+写条件针对的是“写时刻已提交的行”，所以无论两个重叠事务以何种顺序提交，低修订号
+都不可能覆盖高修订号。写后在同一事务内重新读取权威行来判定结果，落败的一方据此
+拿到赢家的当前修订号。于是：
+
+- 修订 3 先提交，另一进程提交修订 2 → `409 {"reason":"stale_revision",
+  "current_revision":3}`；
+- 修订 2 先提交（覆盖 1），修订 3 随后仍可更新；
+- 两个进程**同时**提交 2 与 3 → 终态恒为修订 3 的实际偏移；
+- 并发首报（都为修订 1）按同号规则处理：同值一“插入”一“幂等”，异值一方
+  `revision_value_conflict`。
+
+两次请求结束后，`GET /api/batches/{id}` 批次详情、页面（`/app`）与
+`GET .../warning` 预警都只读取这一条最高修订对应的实际偏移。数据库以 WAL 打开，
+并设置了 `busy_timeout`，第二个进程与首个进程同时初始化时会在锁上重试。
 
 ### 3) 评估预警（含拒绝、逾期、不完整标记）
 
@@ -402,16 +460,18 @@ curl -s "http://localhost:8000/api/batches/2/warning?t=4"
 pip install -r requirements.txt
 python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 vs 密采样
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
-python tests/test_batches_warning.py       # 批次：修订协议/并发最高号/预警分类与冲突
+python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突
 ```
 
 - `test_geometry_crossval.py` 用三套相互独立的实现（多边形/椭圆柱解析、
   连续时间区间剖分、密采样神谕）对上千个随机航段对与擦边案例做一致性校验；
 - `test_solver_bruteforce.py` 在小窗口下穷举所有起飞组合，验证最优目标、
   字典序择优、锁定约束以及无解核的可行性与包含极小性；
-- `test_batches_warning.py` 验证批次冻结、首版为 1/严格递增/幂等/冲突/并发只留
-  最高修订号，以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间冲突
-  区间向 `t` 投影与“重载结果一致”。
+- `test_batches_warning.py` 验证批次冻结、首版为 1/严格递增/幂等/冲突、
+  **两个 OS 进程共享同一 SQLite 文件时并发上报仍只留最高修订号**（用
+  `multiprocessing` 真起两个进程对同一文件做条件写入，含修订 2/3 竞争与
+  并发首报），以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间
+  冲突区间向 `t` 投影与“重载结果一致”。
 
 ---
 
@@ -429,3 +489,7 @@ python tests/test_batches_warning.py       # 批次：修订协议/并发最高�
 - 预警的“计划起飞不早于 `t`”按 `计划偏移 >= t` 判定（恰在 `t` 起飞仍可预测）；
   逾期架次不参与任何冲突对，因此只要存在逾期架次 `incomplete=true`。已上报架次
   的偏离秒数 = 实际偏移 − 计划偏移（负为提前、正为延误）。
+- 多个进程/副本可共用同一个 `DCC_DB_PATH` 指向的 SQLite 文件：数据库以 WAL 打开、
+  设置了忙等待，上报用条件写入仲裁，并发修订不会回退（可用
+  `docker compose --profile multiproc up` 起两个进程并运行
+  `scripts/verify_multiprocess.py` 验证）。

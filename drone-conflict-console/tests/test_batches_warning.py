@@ -156,6 +156,102 @@ def test_concurrent_keeps_highest():
                   f"trial {trial}: highest revision must win, got {outcomes}")
 
 
+def _mp_worker(path, bid, off, rev, barrier, queue):
+    """Open the shared database in a *fresh* process and race one report."""
+    store = Store(path)
+    barrier.wait()
+    outcome, info = store.submit_report(bid, "A", off, rev)
+    queue.put((rev, outcome, info))
+
+
+def test_multiprocess_shared_db():
+    """Two OS processes sharing one SQLite file arbitrate at database level.
+
+    With revision 1 stored, rev 3 and rev 2 are submitted simultaneously from
+    two processes.  Whichever transaction wins, the final row must be the
+    highest revision (3) and the loser must see its current revision.
+    Concurrent first reports (both rev 1) follow the same-revision rules.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        setup = Store(path)
+        sid = setup.create_scenario({"sorties": []}, 30, 10)
+
+        def race(bid, offers):
+            """offers: list of (revision, actual_offset) for racing processes."""
+            barrier = ctx.Barrier(2)
+            queue = ctx.Queue()
+            procs = [
+                ctx.Process(target=_mp_worker,
+                            args=(path, bid, off, rev, barrier, queue))
+                for rev, off in offers
+            ]
+            for p in procs:
+                p.start()
+            results = [queue.get(timeout=30) for _ in procs]
+            for p in procs:
+                p.join(10)
+                check(p.exitcode == 0, "worker process finished cleanly")
+            return results
+
+        # --- revision 3 vs 2 on top of an existing revision 1 ---------------
+        for trial in range(10):
+            bid = setup.create_batch(
+                sid, f"race{trial}", {"sorties": [{"id": "A"}]},
+                30, 10, {"offsets": {"A": 0}})
+            outcome, _ = setup.submit_report(bid, "A", 10, 1)
+            check(outcome == "inserted", "seed revision 1")
+            results = race(bid, [(3, 30), (2, 20)])
+            outcomes = {rev: (o, info) for rev, o, info in results}
+            # Revision 3 is always accepted and the stored row is always 3/30.
+            check(outcomes[3][0] == "inserted",
+                  f"trial {trial}: revision 3 accepted, got {outcomes}")
+            # Revision 2 may either lose outright to the committed 3 ...
+            if outcomes[2][0] == "stale_revision":
+                check(outcomes[2][1]["current_revision"] == 3,
+                      f"trial {trial}: stale rev 2 reports current=3, got {outcomes}")
+            # ... or serialize first (2 written over 1), in which case rev 3
+            # then overwrites it; the invariant is that 2 can never be final.
+            else:
+                check(outcomes[2][0] == "inserted",
+                      f"trial {trial}: rev 2 only allowed to serialize first, "
+                      f"got {outcomes}")
+            row = setup.get_batch(bid)
+            check(len(row["reports"]) == 1
+                  and row["reports"][0]["revision"] == 3
+                  and row["reports"][0]["actual_offset"] == 30,
+                  f"trial {trial}: stored row is the highest revision (3/30)")
+
+        # --- concurrent first reports, same revision 1 ----------------------
+        # Same value: one insert + one idempotent, exactly one row.
+        bid = setup.create_batch(
+            sid, "first-same", {"sorties": [{"id": "A"}]},
+            30, 10, {"offsets": {"A": 0}})
+        results = race(bid, [(1, 5), (1, 5)])
+        # Both carry revision 1; distinguish by outcome only.
+        names = sorted(o for _, o, _ in results)
+        check(names == ["idempotent", "inserted"],
+              f"concurrent identical first reports: {results}")
+        row = setup.get_batch(bid)
+        check(len(row["reports"]) == 1 and row["reports"][0]["actual_offset"] == 5,
+              "single row after concurrent identical first reports")
+
+        # Different values: one insert + one same-revision value conflict.
+        bid = setup.create_batch(
+            sid, "first-diff", {"sorties": [{"id": "A"}]},
+            30, 10, {"offsets": {"A": 0}})
+        results = race(bid, [(1, 5), (1, 6)])
+        names = sorted(o for _, o, _ in results)
+        check(names == ["inserted", "revision_value_conflict"],
+              f"concurrent clashing first reports: {results}")
+        row = setup.get_batch(bid)
+        check(len(row["reports"]) == 1 and row["reports"][0]["revision"] == 1,
+              "single row after concurrent clashing first reports")
+
+
 def test_reload_consistency():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
@@ -179,6 +275,7 @@ def main():
     test_evaluation()
     test_store_revision_protocol()
     test_concurrent_keeps_highest()
+    test_multiprocess_shared_db()
     test_reload_consistency()
     print("failures:", FAILS)
     return FAILS

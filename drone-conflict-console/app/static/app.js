@@ -732,7 +732,10 @@ async function submitReport(sortieId) {
       await evaluateWarning();
     }
   } catch (e) {
+    // Another process may have committed a higher revision concurrently:
+    // reload so the page (and auto +1 revision) reflects the winning row.
     toast(`上报冲突：${e.message}`, 4200);
+    await openBatch(state.batch.batch_id);
   }
 }
 
